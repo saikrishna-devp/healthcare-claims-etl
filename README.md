@@ -1,4 +1,4 @@
-# 🏥 Healthcare Claims ETL Pipeline
+# Healthcare Claims ETL Pipeline
 
 An end-to-end data pipeline that processes 500K pharmacy claims daily using PySpark for transformation, PostgreSQL as the data warehouse, and Apache Airflow for orchestration — with automated data quality validation at every stage.
 
@@ -10,7 +10,7 @@ An end-to-end data pipeline that processes 500K pharmacy claims daily using PySp
 
 ---
 
-## 📐 Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -52,7 +52,7 @@ An end-to-end data pipeline that processes 500K pharmacy claims daily using PySp
 
 ---
 
-## 🗃️ Star Schema
+## Star Schema
 
 ```
                     ┌──────────────────┐
@@ -86,7 +86,7 @@ An end-to-end data pipeline that processes 500K pharmacy claims daily using PySp
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 healthcare-claims-etl/
@@ -152,7 +152,7 @@ $env:PYSPARK_DRIVER_PYTHON="C:\Path\To\Python311\python.exe"
 
 ---
 
-## 📊 Pipeline Results
+## Pipeline Results
 
 | Metric | Value |
 |---|---|
@@ -182,7 +182,7 @@ Top Prescribed Drugs:
 
 ---
 
-## 🔑 Key Features
+## Key Features
 
 - **PySpark processing** - distributed transformation across all CPU cores
 - **Star schema design** - fact + 3 dimension tables optimized for analytics
@@ -208,8 +208,51 @@ Top Prescribed Drugs:
 **Analytics:** Runs SQL queries joining fact and dimension tables to produce business insights - top drugs by revenue, claims by state, quarterly trends.
 
 ---
+---
 
-## 🤝 Connect
+## Two Ways to Run
+
+### Option 1 — Local Demo (run_pipeline.py)
+Single script that runs the complete pipeline locally.
+No cloud accounts needed — just Python, Docker, and Java.
+```bash
+# Start PostgreSQL
+docker run --name claims-db \
+  -e POSTGRES_USER=admin \
+  -e POSTGRES_PASSWORD=admin123 \
+  -e POSTGRES_DB=healthcare_dwh \
+  -p 5432:5432 -d postgres:15
+
+# Run the pipeline
+& "C:\Path\To\Python311\python.exe" run_pipeline.py
+```
+
+What it does:
+- Generates 500K realistic pharmacy claims
+- Runs 8 data quality checks
+- Transforms with PySpark into star schema
+- Loads into PostgreSQL + SQLite
+- Prints analytics results
+
+### Option 2 — Production Architecture (src/ folder)
+The `src/` folder contains the modular production-ready version designed for:
+- **Apache Airflow** orchestration — scheduled daily at 2 AM
+- **Scalable deployment** on cloud infrastructure
+- **Team collaboration** — each module maintained independently
+- **Easy extension** — swap PostgreSQL for Snowflake by changing one file
+```bash
+# Start Airflow locally
+docker-compose up -d
+
+# Access Airflow UI
+# http://localhost:8080
+# Enable DAG: healthcare_claims_pipeline
+```
+
+> The local demo and production architecture use identical business logic.
+> The only difference is infrastructure — one runs on your laptop,
+> the other runs on enterprise cloud infrastructure.
+## Connect
 
 **Saikrishna Suryavamsham** - Senior Data Engineer - Tampa, FL
 
