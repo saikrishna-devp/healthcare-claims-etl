@@ -1,9 +1,15 @@
-aws:
-  region: us-east-1
-  s3_bucket: healthcare-claims-data-lake
-  raw_prefix: raw/claims/
-  processed_prefix: processed/claims/
-  curated_prefix: curated/claims/
+pipeline:
+  raw_file: data/raw_claims.csv
+  db_file: data/healthcare_dwh.db
+  log_file: data/pipeline.log
+  n_records: 500000
+
+database:
+  host: localhost
+  port: 5432
+  name: healthcare_dwh
+  user: admin
+  password: admin123
 
 snowflake:
   account: your-account-id
@@ -13,13 +19,7 @@ snowflake:
   role: DATA_ENGINEER
 
 airflow:
-  dag_id: healthcare_claims_pipeline
   schedule: "0 2 * * *"
   retries: 3
   retry_delay_minutes: 5
   sla_hours: 4
-
-pipeline:
-  lookback_days: 1
-  min_expected_rows: 1000
-  max_expected_rows: 10000000
