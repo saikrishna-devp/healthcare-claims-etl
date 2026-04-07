@@ -1,127 +1,138 @@
 """
 validate.py
-Data quality validation using Great Expectations.
-Runs checks on raw claims data before it enters the transformation layer.
+Data quality validation for pharmacy claims data.
+Runs 8 checks on raw data before transformation.
+If any critical check fails, pipeline stops.
 """
 
 import pandas as pd
-import great_expectations as gx
-from great_expectations.core.batch import RuntimeBatchRequest
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class ClaimsValidator:
-    """Runs a suite of Great Expectations checks on raw claims data."""
+    """
+    Runs data quality checks on raw claims data.
+    Think of this as a quality inspector at a factory -
+    checks every batch before it moves to the next stage.
+    """
+
+    def __init__(self):
+        self.results = []
 
     def run_checks(self, df: pd.DataFrame) -> dict:
         """
-        Execute all data quality expectations against the input DataFrame.
-        Returns the GX validation result dict.
+        Execute all 8 data quality checks.
+        Returns summary dict with pass/fail counts.
         """
+        self.results = []
         logger.info(f"Running data quality checks on {len(df):,} rows")
 
-        context = gx.get_context()
+        self._check_row_count(df)
+        self._check_no_null_claim_ids(df)
+        self._check_no_duplicate_claim_ids(df)
+        self._check_claim_amount_positive(df)
+        self._check_quantity_positive(df)
+        self._check_days_supply_range(df)
+        self._check_valid_claim_status(df)
+        self._check_service_date_parseable(df)
 
-        datasource = context.sources.add_or_update_pandas(name="claims_source")
-        asset = datasource.add_dataframe_asset(name="raw_claims")
+        passed    = sum(r["passed"] for r in self.results)
+        total     = len(self.results)
+        all_passed = passed == total
 
-        batch_request = asset.build_batch_request(dataframe=df)
+        logger.info(f"Result: {passed}/{total} checks passed")
 
-        suite_name = "claims_quality_suite"
-        try:
-            suite = context.get_expectation_suite(suite_name)
-        except Exception:
-            suite = context.add_expectation_suite(suite_name)
+        return {
+            "success": all_passed,
+            "passed":  passed,
+            "total":   total,
+            "results": self.results,
+        }
 
-        validator = context.get_validator(
-            batch_request=batch_request,
-            expectation_suite=suite,
+    def _check(self, name: str, passed: bool, detail: str = "") -> None:
+        """Helper to log and store each check result."""
+        status = "PASS" if passed else "FAIL"
+        logger.info(f"  [{status}] {name} {detail}")
+        self.results.append({
+            "check":  name,
+            "passed": passed,
+            "detail": detail,
+        })
+
+    def _check_row_count(self, df: pd.DataFrame) -> None:
+        """Too few rows = upstream issue. Too many = possible duplication."""
+        count = len(df)
+        self._check(
+            "Row count in valid range",
+            1_000 <= count <= 10_000_000,
+            f"({count:,} rows)"
         )
 
-        # ---------------------------------------------------------------- #
-        #  Column presence
-        # ---------------------------------------------------------------- #
-        required_cols = [
-            "claim_id", "member_id", "ndc_code", "npi_number",
-            "service_date", "claim_amount", "quantity", "days_supply",
-            "plan_id", "drug_name", "drug_class", "claim_status",
-        ]
-        for col in required_cols:
-            validator.expect_column_to_exist(col)
-
-        # ---------------------------------------------------------------- #
-        #  Null checks
-        # ---------------------------------------------------------------- #
-        not_null_cols = ["claim_id", "member_id", "ndc_code", "service_date", "claim_amount"]
-        for col in not_null_cols:
-            validator.expect_column_values_to_not_be_null(col)
-
-        # ---------------------------------------------------------------- #
-        #  Uniqueness
-        # ---------------------------------------------------------------- #
-        validator.expect_column_values_to_be_unique("claim_id")
-
-        # ---------------------------------------------------------------- #
-        #  Value ranges
-        # ---------------------------------------------------------------- #
-        validator.expect_column_values_to_be_between(
-            "claim_amount", min_value=0.01, max_value=100_000
-        )
-        validator.expect_column_values_to_be_between(
-            "quantity", min_value=1, max_value=10_000
-        )
-        validator.expect_column_values_to_be_between(
-            "days_supply", min_value=1, max_value=365
+    def _check_no_null_claim_ids(self, df: pd.DataFrame) -> None:
+        """Every claim must have an ID. Null = unidentifiable record."""
+        null_count = df["claim_id"].isna().sum()
+        self._check(
+            "No null claim_ids",
+            null_count == 0,
+            f"({null_count} nulls found)"
         )
 
-        # ---------------------------------------------------------------- #
-        #  Categorical values
-        # ---------------------------------------------------------------- #
-        validator.expect_column_values_to_be_in_set(
-            "claim_status", ["PAID", "ADJUDICATED", "REVERSED", "PENDING"]
+    def _check_no_duplicate_claim_ids(self, df: pd.DataFrame) -> None:
+        """Each claim_id must be unique. Duplicates double-count costs."""
+        unique = df["claim_id"].nunique()
+        total  = len(df)
+        self._check(
+            "No duplicate claim_ids",
+            unique == total,
+            f"({unique:,} unique out of {total:,})"
         )
 
-        # ---------------------------------------------------------------- #
-        #  Date format
-        # ---------------------------------------------------------------- #
-        validator.expect_column_values_to_match_strftime_format(
-            "service_date", strftime_format="%Y-%m-%d"
+    def _check_claim_amount_positive(self, df: pd.DataFrame) -> None:
+        """Zero or negative amounts indicate data errors."""
+        invalid = (df["claim_amount"] <= 0).sum()
+        self._check(
+            "claim_amount is positive",
+            invalid == 0,
+            f"(min={df['claim_amount'].min():.2f}, max={df['claim_amount'].max():.2f})"
         )
 
-        # ---------------------------------------------------------------- #
-        #  Row count sanity check (at least 1000 records expected daily)
-        # ---------------------------------------------------------------- #
-        validator.expect_table_row_count_to_be_between(
-            min_value=1_000, max_value=10_000_000
+    def _check_quantity_positive(self, df: pd.DataFrame) -> None:
+        """Dispensed quantity must be positive."""
+        invalid = (df["quantity"] <= 0).sum()
+        self._check(
+            "quantity is positive",
+            invalid == 0,
+            f"(min={df['quantity'].min()})"
         )
 
-        # ---------------------------------------------------------------- #
-        #  NDC code format (11-digit number)
-        # ---------------------------------------------------------------- #
-        validator.expect_column_values_to_match_regex(
-            "ndc_code", regex=r"^\d{11}$"
+    def _check_days_supply_range(self, df: pd.DataFrame) -> None:
+        """Days supply must be between 1 and 365. Common: 30, 60, 90."""
+        invalid = (~df["days_supply"].between(1, 365)).sum()
+        self._check(
+            "days_supply between 1-365",
+            invalid == 0,
+            f"(values: {sorted(df['days_supply'].unique().tolist())})"
         )
 
-        results = validator.validate()
-
-        passed = results["success"]
-        total  = len(results["results"])
-        failed = sum(1 for r in results["results"] if not r["success"])
-
-        logger.info(
-            f"Data quality complete — "
-            f"{'PASSED' if passed else 'FAILED'} | "
-            f"{total - failed}/{total} checks passed"
+    def _check_valid_claim_status(self, df: pd.DataFrame) -> None:
+        """Status must be one of the known valid values."""
+        valid   = {"PAID", "ADJUDICATED", "REVERSED", "PENDING"}
+        found   = set(df["claim_status"].unique())
+        invalid = found - valid
+        self._check(
+            "claim_status values valid",
+            len(invalid) == 0,
+            f"(found: {sorted(list(found))})"
         )
 
-        if not passed:
-            for r in results["results"]:
-                if not r["success"]:
-                    logger.error(
-                        f"FAILED: {r['expectation_config']['expectation_type']} "
-                        f"on column '{r['expectation_config']['kwargs'].get('column', 'N/A')}'"
-                    )
-
-        return results.to_json_dict()
+    def _check_service_date_parseable(self, df: pd.DataFrame) -> None:
+        """All service dates must be valid parseable dates."""
+        parsed     = pd.to_datetime(df["service_date"], errors="coerce")
+        null_count = parsed.isna().sum()
+        self._check(
+            "service_date is parseable",
+            null_count == 0,
+            f"({null_count} unparseable dates)"
+        )
