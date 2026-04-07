@@ -1,191 +1,173 @@
 """
 transform.py
 PySpark transformation layer for pharmacy claims data.
-Handles cleaning, standardization, SCD Type 2, and dimensional modeling.
+Handles cleaning, standardization, HIPAA compliance,
+and building the star schema dimensional model.
 """
 
+import os
+import pandas as pd
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField, StringType,
-    DoubleType, IntegerType, DateType, TimestampType
-)
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+PYTHON_PATH = r"C:\Users\saira\AppData\Local\Programs\Python\Python311\python.exe"
+os.environ["PYSPARK_PYTHON"]        = PYTHON_PATH
+os.environ["PYSPARK_DRIVER_PYTHON"] = PYTHON_PATH
+
 
 def get_spark_session(app_name: str = "HealthcareClaimsETL") -> SparkSession:
-    """Create or retrieve a SparkSession with optimized configs."""
+    """
+    Create or retrieve a SparkSession with optimized configs.
+    SparkSession is the entry point to all PySpark functionality.
+    """
     return (
         SparkSession.builder
         .appName(app_name)
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.shuffle.partitions", "200")
-        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.execution.pyspark.udf.faulthandler.enabled", "true")
         .getOrCreate()
     )
 
 
 class ClaimsTransformer:
-    """Applies all PySpark transformations to raw claims data."""
+    """
+    Applies all PySpark transformations to raw claims data.
+    Produces a star schema with 1 fact table and 3 dimension tables.
+    """
 
     def __init__(self, spark: SparkSession):
         self.spark = spark
 
-    # ------------------------------------------------------------------ #
-    #  Raw claims schema
-    # ------------------------------------------------------------------ #
-    RAW_SCHEMA = StructType([
-        StructField("claim_id",        StringType(),    False),
-        StructField("member_id",       StringType(),    False),
-        StructField("ndc_code",        StringType(),    True),
-        StructField("npi_number",      StringType(),    True),
-        StructField("service_date",    StringType(),    True),
-        StructField("dispensed_date",  StringType(),    True),
-        StructField("claim_amount",    DoubleType(),    True),
-        StructField("quantity",        DoubleType(),    True),
-        StructField("days_supply",     IntegerType(),   True),
-        StructField("plan_id",         StringType(),    True),
-        StructField("drug_name",       StringType(),    True),
-        StructField("drug_class",      StringType(),    True),
-        StructField("member_state",    StringType(),    True),
-        StructField("claim_status",    StringType(),    True),
-        StructField("created_at",      TimestampType(), True),
-    ])
-
-    # ------------------------------------------------------------------ #
-    #  Cleaning & standardization
-    # ------------------------------------------------------------------ #
-    def clean_claims(self, df: DataFrame) -> DataFrame:
+    def run(self, raw_df: pd.DataFrame) -> dict:
         """
-        Apply data cleaning rules:
-        - Drop duplicates on claim_id
-        - Filter invalid amounts and quantities
-        - Standardize date formats
-        - Uppercase categorical columns
-        - Mask member PII fields for HIPAA compliance
+        Run the full transformation pipeline.
+        Returns dict of Pandas DataFrames keyed by table name.
         """
-        logger.info(f"Starting clean_claims — input rows: {df.count():,}")
+        logger.info(f"Starting transformation - input: {len(raw_df):,} rows")
 
-        cleaned = (
-            df
+        sdf = self.spark.createDataFrame(raw_df)
+        self.spark.sparkContext.setLogLevel("ERROR")
+        logger.info("Spark DataFrame created")
+
+        cleaned = self._clean(sdf)
+
+        logger.info("Building dimension tables...")
+        dim_drug     = self._build_dim_drug(cleaned)
+        dim_provider = self._build_dim_provider(cleaned)
+        dim_date     = self._build_dim_date(cleaned)
+
+        logger.info("Building fact table...")
+        fact_claims = self._build_fact_claims(cleaned)
+
+        logger.info("Converting Spark DataFrames to Pandas...")
+        result = {
+            "dim_drug":     dim_drug.toPandas(),
+            "dim_provider": dim_provider.toPandas(),
+            "dim_date":     dim_date.toPandas(),
+            "fact_claims":  fact_claims.toPandas(),
+        }
+
+        for name, df in result.items():
+            logger.info(f"  {name}: {len(df):,} rows")
+
+        return result
+
+    def _clean(self, sdf: DataFrame) -> DataFrame:
+        """
+        Apply all cleaning and standardization rules.
+        Raw messy data becomes clean analytics-ready data.
+        """
+        logger.info("Applying cleaning transformations...")
+
+        return (
+            sdf
             .dropDuplicates(["claim_id"])
+            .withColumn("claim_amount", F.col("claim_amount").cast("double"))
+            .withColumn("quantity",     F.col("quantity").cast("double"))
+            .withColumn("days_supply",  F.col("days_supply").cast("integer"))
+            .withColumn("service_date",
+                        F.to_date(F.col("service_date"), "yyyy-MM-dd"))
+            .withColumn("drug_class",
+                        F.upper(F.trim(F.col("drug_class"))))
+            .withColumn("claim_status",
+                        F.upper(F.trim(F.col("claim_status"))))
+            # HIPAA compliance - hash member IDs
+            # SHA2 is one-way - cannot be reversed to original ID
+            .withColumn("member_id",
+                        F.sha2(F.col("member_id"), 256))
+            .withColumn("etl_processed_at", F.current_timestamp())
             .filter(F.col("claim_amount") > 0)
             .filter(F.col("quantity") > 0)
             .filter(F.col("days_supply").between(1, 365))
-            .filter(F.col("claim_status").isin("PAID", "ADJUDICATED", "REVERSED"))
-            .withColumn("service_date",   F.to_date("service_date",   "yyyy-MM-dd"))
-            .withColumn("dispensed_date", F.to_date("dispensed_date", "yyyy-MM-dd"))
-            .withColumn("drug_class",  F.upper(F.trim(F.col("drug_class"))))
-            .withColumn("member_state",F.upper(F.trim(F.col("member_state"))))
-            .withColumn("claim_status",F.upper(F.trim(F.col("claim_status"))))
-            # HIPAA: hash member_id before storing
-            .withColumn("member_id", F.sha2(F.col("member_id"), 256))
-            .withColumn("etl_processed_at", F.current_timestamp())
         )
 
-        logger.info(f"clean_claims complete — output rows: {cleaned.count():,}")
-        return cleaned
-
-    # ------------------------------------------------------------------ #
-    #  Dimension builders
-    # ------------------------------------------------------------------ #
-    def build_dim_drug(self, df: DataFrame) -> DataFrame:
-        """Build DIM_DRUG from distinct NDC codes in the claims data."""
+    def _build_dim_drug(self, df: DataFrame) -> DataFrame:
+        """
+        Build DIM_DRUG - one row per unique drug (15 rows).
+        Small lookup table referenced by fact_claims.
+        """
         return (
             df
             .select("ndc_code", "drug_name", "drug_class")
             .dropDuplicates(["ndc_code"])
-            .withColumn("drug_key", F.sha2(F.col("ndc_code"), 256))
-            .withColumn("effective_start", F.current_date())
-            .withColumn("effective_end",   F.lit(None).cast(DateType()))
-            .withColumn("is_current",      F.lit(True))
+            .withColumn("drug_key",
+                        F.sha2(F.col("ndc_code").cast("string"), 256))
         )
 
-    def build_dim_provider(self, df: DataFrame) -> DataFrame:
-        """Build DIM_PROVIDER from distinct NPI numbers."""
+    def _build_dim_provider(self, df: DataFrame) -> DataFrame:
+        """
+        Build DIM_PROVIDER - one row per unique provider.
+        NPI = National Provider Identifier, unique ID for US healthcare providers.
+        """
         return (
             df
             .select("npi_number", "member_state")
             .dropDuplicates(["npi_number"])
-            .withColumnRenamed("member_state", "provider_state")
-            .withColumn("provider_key", F.sha2(F.col("npi_number"), 256))
-            .withColumn("effective_start", F.current_date())
-            .withColumn("effective_end",   F.lit(None).cast(DateType()))
-            .withColumn("is_current",      F.lit(True))
+            .withColumn("provider_key",
+                        F.sha2(F.col("npi_number").cast("string"), 256))
         )
 
-    def build_dim_date(self, df: DataFrame) -> DataFrame:
-        """Build DIM_DATE from all service dates in the dataset."""
+    def _build_dim_date(self, df: DataFrame) -> DataFrame:
+        """
+        Build DIM_DATE - one row per unique date (336 rows).
+        Extracts year, month, quarter for easy time-based filtering.
+        """
         return (
             df
             .select(F.col("service_date").alias("date_value"))
             .dropDuplicates()
-            .withColumn("date_key",   F.date_format("date_value", "yyyyMMdd").cast("int"))
             .withColumn("year",       F.year("date_value"))
             .withColumn("month",      F.month("date_value"))
-            .withColumn("day",        F.dayofmonth("date_value"))
             .withColumn("quarter",    F.quarter("date_value"))
-            .withColumn("week",       F.weekofyear("date_value"))
-            .withColumn("day_name",   F.date_format("date_value", "EEEE"))
+            .withColumn("day",        F.dayofmonth("date_value"))
             .withColumn("month_name", F.date_format("date_value", "MMMM"))
+            .withColumn("day_name",   F.date_format("date_value", "EEEE"))
             .withColumn("is_weekend", F.dayofweek("date_value").isin([1, 7]))
         )
 
-    # ------------------------------------------------------------------ #
-    #  Fact table builder
-    # ------------------------------------------------------------------ #
-    def build_fact_claims(self, df: DataFrame) -> DataFrame:
+    def _build_fact_claims(self, df: DataFrame) -> DataFrame:
         """
-        Build FACT_CLAIMS with surrogate keys referencing all dimensions.
-        Aggregates at claim grain — one row per claim_id.
+        Build FACT_CLAIMS - one row per claim (500K rows).
+        Central table of the star schema containing all measurable values.
+        References dimension tables via surrogate keys.
         """
         return (
             df
-            .filter(F.col("claim_status") == "PAID")
-            .withColumn("claim_key",    F.sha2(F.col("claim_id"), 256))
-            .withColumn("member_key",   F.col("member_id"))   # already hashed
-            .withColumn("drug_key",     F.sha2(F.col("ndc_code"), 256))
-            .withColumn("provider_key", F.sha2(F.col("npi_number"), 256))
-            .withColumn("date_key",     F.date_format("service_date", "yyyyMMdd").cast("int"))
+            .withColumn("claim_key",
+                        F.sha2(F.col("claim_id"), 256))
+            .withColumn("member_key",
+                        F.col("member_id"))
+            .withColumn("drug_key",
+                        F.sha2(F.col("ndc_code").cast("string"), 256))
+            .withColumn("provider_key",
+                        F.sha2(F.col("npi_number").cast("string"), 256))
             .select(
-                "claim_key",
-                "member_key",
-                "drug_key",
-                "provider_key",
-                "date_key",
-                "claim_amount",
-                "quantity",
-                "days_supply",
-                "plan_id",
-                "claim_status",
-                "dispensed_date",
-                "etl_processed_at",
+                "claim_key", "member_key", "drug_key", "provider_key",
+                "service_date", "claim_amount", "quantity",
+                "days_supply", "plan_id", "claim_status", "etl_processed_at",
             )
         )
-
-    # ------------------------------------------------------------------ #
-    #  Orchestrate all transformations
-    # ------------------------------------------------------------------ #
-    def run(self, raw_df: DataFrame) -> dict[str, DataFrame]:
-        """
-        Run the full transformation pipeline.
-        Returns a dict of DataFrames keyed by target table name.
-        """
-        logger.info("Starting full transformation pipeline")
-        cleaned = self.clean_claims(raw_df)
-
-        result = {
-            "dim_drug":     self.build_dim_drug(cleaned),
-            "dim_provider": self.build_dim_provider(cleaned),
-            "dim_date":     self.build_dim_date(cleaned),
-            "fact_claims":  self.build_fact_claims(cleaned),
-        }
-
-        for name, tdf in result.items():
-            logger.info(f"{name}: {tdf.count():,} rows")
-
-        logger.info("Transformation pipeline complete")
-        return result
