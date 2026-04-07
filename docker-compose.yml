@@ -2,11 +2,14 @@ version: '3.8'
 
 services:
   postgres:
-    image: postgres:13
+    image: postgres:15
+    container_name: claims-db
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: healthcare_dwh
+    ports:
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
@@ -30,8 +33,6 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-      SNOWFLAKE_USER: ${SNOWFLAKE_USER}
-      SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD}
     volumes:
       - ./src/dags:/opt/airflow/dags
       - ./src:/opt/airflow/src
@@ -46,8 +47,6 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-      SNOWFLAKE_USER: ${SNOWFLAKE_USER}
-      SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD}
     volumes:
       - ./src/dags:/opt/airflow/dags
       - ./src:/opt/airflow/src
